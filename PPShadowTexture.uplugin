@@ -1,0 +1,20 @@
+{
+	"FileVersion": 3,
+	"Version": 2,
+	"VersionName": "1.0.0",
+	"FriendlyName": "PP Shadow Texture",
+	"Description": "Publishes UE's own shadows (CSM / VSM / local light shadow maps) as the UserSceneTexture 'PPShadowTexture' for post process materials. R = main directional light, G = all shadowed local lights combined. UE 5.8 only.",
+	"Category": "Rendering",
+	"CreatedBy": "",
+	"EngineVersion": "5.8.0",
+	"CanContainContent": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "PPShadowTexture",
+			"Type": "Runtime",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [ "Win64" ]
+		}
+	]
+}

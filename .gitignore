@@ -1,0 +1,14 @@
+# Unreal build output (compiled binaries can contain engine code: never commit them)
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+
+# IDE and tools
+.vs/
+.vscode/
+.idea/
+.claude/
+*.sln
+*.suo
+*.user

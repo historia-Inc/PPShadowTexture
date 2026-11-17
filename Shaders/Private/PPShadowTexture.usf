@@ -1,0 +1,377 @@
+// PPShadowTexture: UE's own shadows sampled into screen space.
+// PPST_MODE selects the pass (EMode in PPShadowTextureMask.cpp):
+//   0..2 Compose: R = main directional light shadow (none / CSM / VSM),
+//        G = 1 - Lost / (sun irradiance * R + E) -> PPST_MaskOutput
+//   3, 4 Local array (unshadowed / with VSM): E = sum of local light irradiance, Lost = the part their shadows block
+//   5, 6 Local Spot / Cube: E, Lost += one light with a conventional shadow map
+#define PPST_COMPOSE_NONE		0
+#define PPST_COMPOSE_CSM		1
+#define PPST_COMPOSE_VSM		2
+#define PPST_LOCAL_ARRAY		3
+#define PPST_LOCAL_ARRAY_VSM	4
+#define PPST_LOCAL_SPOT			5
+#define PPST_LOCAL_CUBE			6
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Shared/LightDefinitions.h"
+
+#if PPST_MODE == PPST_COMPOSE_CSM || PPST_MODE == PPST_LOCAL_SPOT
+#include "/Engine/Private/ShadowFilteringCommon.ush"
+#endif
+#if PPST_MODE == PPST_LOCAL_CUBE
+#define SHADOW_QUALITY 3				// CubemapHardwarePCF: 5 disc taps, the tier of Manual3x3PCF
+#define NO_TRANSLUCENCY_AVAILABLE 1
+#include "/Engine/Private/ShadowProjectionCommon.ush"
+#endif
+#if PPST_MODE == PPST_COMPOSE_VSM || PPST_MODE == PPST_LOCAL_ARRAY_VSM
+#include "/Engine/Private/VirtualShadowMaps/VirtualShadowMapProjectionCommon.ush"
+#include "/Engine/Private/VirtualShadowMaps/VirtualShadowMapScreenRayTrace.ush"	// reads SceneTexturesStruct
+#endif
+#if PPST_MODE >= PPST_LOCAL_ARRAY
+#include "/Engine/Private/CapsuleLight.ush"
+#include "/Engine/Private/DynamicLightingCommon.ush"
+#endif
+
+Texture2D PPST_SceneDepth;
+int2 PPST_ViewMin;
+int2 PPST_ViewSize;
+int2 PPST_OutputSize;
+
+Texture2D PPST_ShadowDepth;
+SamplerState PPST_ShadowDepthSampler;
+float4 PPST_ShadowBufferSize;
+float4x4 PPST_TranslatedWorldToShadowClip[PPST_MAX_CASCADES];	// z scaled to the stored depth range
+float4 PPST_ShadowTileMinMax[PPST_MAX_CASCADES];			// the tile's UV rect in the atlas
+float4 PPST_ShadowParams[PPST_MAX_CASCADES];				// x split far (view depth), y transition scale, z fade alpha, w receiver bias (0..1)
+float3 PPST_DirectionalToLight;
+int PPST_NumShadows;
+float PPST_ShadowSharpen;
+
+TextureCube PPST_CubeShadowDepth;
+SamplerComparisonState PPST_CubeShadowSampler;
+float4x4 PPST_CubeViewProjection[6];
+float4 PPST_CubeParams;								// x 1/resolution, y depth bias, z slope bias, w max slope bias
+float PPST_CubeFade;
+
+float4 PPST_LightPositionAndInvRadius[PPST_MAX_LIGHTS];	// translated world
+float4 PPST_LightDirectionAndCosOuter[PPST_MAX_LIGHTS];	// FLightRenderParameters::Direction (points back toward the light)
+float4 PPST_LightEnergy[PPST_MAX_LIGHTS];				// x luminance * diffuse scale, y spot 1/(cos inner - cos outer), z falloff exponent, w source radius (rect: half width)
+float4 PPST_LightTangentAndLength[PPST_MAX_LIGHTS];		// xyz tangent, w source length (rect: half height)
+int4 PPST_LightTypeAndVsmId[PPST_MAX_LIGHTS];			// x type, y VSM id (-1: unshadowed), z inverse squared
+int PPST_NumLights;
+int PPST_DirectionalVsmId;
+float PPST_DirectionalEnergy;
+
+Texture2D<float> PPST_LocalEnergy;
+Texture2D<float> PPST_LocalLost;
+RWTexture2D<float> PPST_LocalEnergyOutput;
+RWTexture2D<float> PPST_LocalLostOutput;
+RWTexture2D<float2> PPST_MaskOutput;
+
+float LoadDeviceZ(int2 Pixel)
+{
+	return PPST_SceneDepth.Load(int3(Pixel, 0)).r;
+}
+
+float3 PixelToTranslatedWorld(int2 Pixel, float DeviceZ)
+{
+	return SvPositionToTranslatedWorld(float4(Pixel + 0.5, DeviceZ, 1));
+}
+
+// Geometric normal from the depth buffer, for receiver bias (UE derives the same from ddx/ddy of the
+// position in VirtualShadowMapProjection.usf). On each axis the neighbor with the closer depth is used,
+// so silhouettes do not bend it. Returns 0 when it cannot be estimated.
+float3 EstimateGeoNormal(int2 Pixel, float DeviceZ, float3 TranslatedWorld)
+{
+	const int2 ViewMax = PPST_ViewMin + PPST_ViewSize - 1;
+	const bool bHasLeft = Pixel.x > PPST_ViewMin.x, bHasRight = Pixel.x < ViewMax.x;
+	const bool bHasUp = Pixel.y > PPST_ViewMin.y, bHasDown = Pixel.y < ViewMax.y;
+	const float ZL = bHasLeft ? LoadDeviceZ(Pixel - int2(1, 0)) : 0;
+	const float ZR = bHasRight ? LoadDeviceZ(Pixel + int2(1, 0)) : 0;
+	const float ZU = bHasUp ? LoadDeviceZ(Pixel - int2(0, 1)) : 0;
+	const float ZD = bHasDown ? LoadDeviceZ(Pixel + int2(0, 1)) : 0;
+	const bool bUseRight = bHasRight && (!bHasLeft || abs(ZR - DeviceZ) < abs(ZL - DeviceZ));
+	const bool bUseDown = bHasDown && (!bHasUp || abs(ZD - DeviceZ) < abs(ZU - DeviceZ));
+	if ((bUseRight ? ZR : ZL) <= 0 || (bUseDown ? ZD : ZU) <= 0)
+	{
+		return 0;
+	}
+	const float3 DX = bUseRight ? PixelToTranslatedWorld(Pixel + int2(1, 0), ZR) - TranslatedWorld
+		: TranslatedWorld - PixelToTranslatedWorld(Pixel - int2(1, 0), ZL);
+	const float3 DY = bUseDown ? PixelToTranslatedWorld(Pixel + int2(0, 1), ZD) - TranslatedWorld
+		: TranslatedWorld - PixelToTranslatedWorld(Pixel - int2(0, 1), ZU);
+	float3 N = cross(DX, DY);
+	const float LengthSq = dot(N, N);
+	if (!(LengthSq > 1e-8f))
+	{
+		return 0;
+	}
+	N *= rsqrt(LengthSq);
+	return dot(N, View.TranslatedWorldCameraOrigin - TranslatedWorld) < 0 ? -N : N;
+}
+
+// UE uses the shading normal from the GBuffer; the depth normal stands in for it. Without one, NoL = 1.
+float GetNoL(float3 Normal, float3 ToLight)
+{
+	return any(Normal != 0) ? saturate(dot(Normal, ToLight)) : 1.0f;
+}
+
+#if PPST_MODE == PPST_COMPOSE_CSM || PPST_MODE == PPST_LOCAL_SPOT
+// One 2D shadow map tile, filtered like ShadowProjectionPixelShader.usf (receiver bias from NoL, Manual3x3PCF,
+// sharpen, PCF over-blur correction, fade). bInTile is false when the position projects outside the tile.
+float SampleShadowMap2D(int Slot, float3 TranslatedWorld, float NoL, out bool bInTile)
+{
+	bInTile = false;
+	const float4 ShadowClip = mul(float4(TranslatedWorld, 1), PPST_TranslatedWorldToShadowClip[Slot]);
+	if (ShadowClip.w <= 0)
+	{
+		return 1;
+	}
+	const float ShadowZ = 1 - ShadowClip.z;
+	// Clip space x right, y up -> the tile's UV rect (v down).
+	const float4 Tile = PPST_ShadowTileMinMax[Slot];
+	const float2 ShadowUV = Tile.xy + (ShadowClip.xy / ShadowClip.w * float2(0.5, -0.5) + 0.5) * (Tile.zw - Tile.xy);
+	if (any(ShadowUV < Tile.xy) || any(ShadowUV > Tile.zw))
+	{
+		return 1;
+	}
+	bInTile = true;
+
+	FPCFSamplerSettings Settings;
+	Settings.ShadowDepthTexture = PPST_ShadowDepth;
+	Settings.ShadowDepthTextureSampler = PPST_ShadowDepthSampler;
+	Settings.ShadowBufferSize = PPST_ShadowBufferSize;
+	Settings.SceneDepth = min(ShadowZ, 0.99999f);
+	// Receiver bias: surfaces turned away from the light lose up to that share of the transition size.
+	Settings.TransitionScale = PPST_ShadowParams[Slot].y * (1.0f - PPST_ShadowParams[Slot].w * (1.0f - NoL));
+	Settings.bSubsurface = false;
+	Settings.bTreatMaxDepthUnshadowed = false;
+	Settings.DensityMulConstant = 0;
+	Settings.ProjectionDepthBiasParameters = 0;
+	float Shadow = Manual3x3PCF(ShadowUV, Settings);
+	Shadow = saturate((Shadow - 0.5) * PPST_ShadowSharpen + 0.5);
+	Shadow = Square(Shadow);
+	return lerp(1.0f, Shadow, PPST_ShadowParams[Slot].z);
+}
+#endif
+
+#if PPST_MODE == PPST_COMPOSE_VSM || PPST_MODE == PPST_LOCAL_ARRAY_VSM
+// One VSM lookup prepared as VirtualShadowMapProjection.usf does before its SMRT rays: normal bias, then a screen
+// space ray to step off the receiver. The depth normal stands in for both the shading and the geometric normal.
+float SampleVirtualShadowMap(bool bDirectional, int VirtualShadowMapId, float3 TranslatedWorld, float3 Normal, float3 ToLight, float SceneDepth)
+{
+	const float3 Biased = TranslatedWorld + Normal * VirtualShadowMapGetNormalBiasLength(TranslatedWorld);
+	const float RayLength = GetScreenRayLengthMultiplierForProjectionType(VirtualShadowMap.ScreenRayLength * SceneDepth).y;
+	// Dither 0.5: the same step positions on every pixel (no temporal accumulation follows to hide the noise).
+	const float RayStart = RayLength > 0 ? VirtualShadowMapScreenRayCast(Biased, ToLight, RayLength, 0.5f) : 0;
+	FVirtualShadowMapSampleResult Result;
+	if (bDirectional)
+	{
+		Result = SampleVirtualShadowMapDirectional(VirtualShadowMapId, Biased, RayStart, Normal, true);
+	}
+	else
+	{
+		// SceneDepth selects the mip the receiver marked, as UE does; without it the greedy pick can land on a cached
+		// finer page that was rendered with a receiver mask not covering this pixel and reads as unshadowed.
+		Result = SampleVirtualShadowMapLocal(VirtualShadowMapId, Biased, RayStart, Normal, true, SceneDepth);
+	}
+	return Result.bValid ? Result.ShadowFactor : 1.0f;
+}
+#endif
+
+#if PPST_MODE >= PPST_LOCAL_ARRAY
+// NoL for a light that covers a cap of sin^2 = SinAlphaSqr. SphereHorizonCosWrap divides by the cap's size,
+// so a source without one (a point) takes the plain clamp.
+float HorizonCosWrap(float NoL, float SinAlphaSqr)
+{
+	return SinAlphaSqr > 0 ? saturate(SphereHorizonCosWrap(NoL, SinAlphaSqr)) : saturate(NoL);
+}
+
+// Lambert's formula for a polygonal emitter of unit radiance: each edge (A, B of unit length, seen from the pixel)
+// adds the angle it subtends times the unit normal of the plane through it and the pixel.
+float3 EdgeIrradiance(float3 A, float3 B)
+{
+	const float3 PlaneNormal = cross(A, B);
+	const float SinAngle = length(PlaneNormal);
+	return SinAngle > 1e-6f ? PlaneNormal * (acos(clamp(dot(A, B), -1.0f, 1.0f)) / SinAngle) : 0;
+}
+
+// Irradiance vector of a rectangle with half extents Extent along AxisX / AxisY, centered at ToCenter from the pixel.
+float3 RectIrradianceVector(float3 ToCenter, float3 AxisX, float3 AxisY, float2 Extent)
+{
+	const float2 CornerSigns[4] = { float2(-1, -1), float2(1, -1), float2(1, 1), float2(-1, 1) };
+	float3 Corners[4];
+	UNROLL
+	for (int Corner = 0; Corner < 4; ++Corner)
+	{
+		Corners[Corner] = normalize(ToCenter + AxisX * (CornerSigns[Corner].x * Extent.x) + AxisY * (CornerSigns[Corner].y * Extent.y));
+	}
+	float3 Sum = 0;
+	UNROLL
+	for (int Edge = 0; Edge < 4; ++Edge)
+	{
+		Sum += EdgeIrradiance(Corners[Edge], Corners[(Edge + 1) % 4]);
+	}
+	return 0.5f * Sum;
+}
+
+// Diffuse irradiance (lux, ignoring albedo and the BRDF) the local light brings to the pixel without shadows,
+// with the depth normal in place of the shading normal:
+// - distance: inverse squared lights use the windowed falloff of "Real Shading in Unreal Engine 4" (Karis 2013),
+//   the others UE's RadialAttenuation; spot lights add UE's SpotAttenuation
+// - sphere lights: 1 / (d^2 + 1) for inverse squared lights, NoL wrapped over the source radius
+// - rect lights: the exact Lambert integral (UE's deferred lighting uses an approximation of it)
+float GetLocalIrradiance(int Index, float3 TranslatedWorld, float3 Normal)
+{
+	const float3 ToLight = PPST_LightPositionAndInvRadius[Index].xyz - TranslatedWorld;
+	const float DistanceSq = dot(ToLight, ToLight);
+	const float3 L = ToLight * rsqrt(max(DistanceSq, 1e-8f));
+	const float InvRadius = PPST_LightPositionAndInvRadius[Index].w;
+	const float4 Energy = PPST_LightEnergy[Index];
+	const int LightType = PPST_LightTypeAndVsmId[Index].x;
+	const bool bInverseSquared = PPST_LightTypeAndVsmId[Index].z != 0;
+	const float3 Direction = PPST_LightDirectionAndCosOuter[Index].xyz;
+	const bool bHasNormal = any(Normal != 0);
+
+	// Window: 1 at the light, 0 at its attenuation radius.
+	const float NormalizedDistanceSq = DistanceSq * Square(InvRadius);
+	float LightMask = bInverseSquared
+		? Square(saturate(1 - Square(NormalizedDistanceSq)))
+		: RadialAttenuation(ToLight * InvRadius, Energy.z);
+	if (LightType == LIGHT_TYPE_SPOT)
+	{
+		// SpotAttenuation takes the direction the light points in; Direction points back toward the light.
+		LightMask *= SpotAttenuation(L, -Direction, float2(PPST_LightDirectionAndCosOuter[Index].w, Energy.y));
+	}
+	if (LightMask <= 0)
+	{
+		return 0;
+	}
+
+	if (LightType == LIGHT_TYPE_RECT)
+	{
+		// The rect emits only to the front (Direction points back toward the light from the lit side).
+		if (dot(Direction, L) < 0)
+		{
+			return 0;
+		}
+		const float3 AxisY = PPST_LightTangentAndLength[Index].xyz;
+		const float3 AxisX = cross(AxisY, Direction);
+		const float2 Extent = float2(Energy.w, PPST_LightTangentAndLength[Index].w);
+		float3 VectorIrradiance = RectIrradianceVector(ToLight, AxisX, AxisY, Extent);
+		VectorIrradiance = dot(VectorIrradiance, ToLight) < 0 ? -VectorIrradiance : VectorIrradiance;
+		const float BaseIrradiance = length(VectorIrradiance);
+		const float NoL = bHasNormal ? HorizonCosWrap(dot(Normal, VectorIrradiance / max(BaseIrradiance, 1e-8f)), BaseIrradiance / PI) : 1.0f;
+		return Energy.x * LightMask * BaseIrradiance * NoL;
+	}
+
+	const float SphereFalloff = 1.0f / (DistanceSq + 1.0f);
+	const float NoL = bHasNormal ? HorizonCosWrap(dot(Normal, L), saturate(Square(Energy.w) * SphereFalloff)) : 1.0f;
+	return Energy.x * LightMask * (bInverseSquared ? SphereFalloff : 1.0f) * NoL;
+}
+#endif
+
+[numthreads(8, 8, 1)]
+void MainCS(uint2 Texel : SV_DispatchThreadID)
+{
+	if (any(int2(Texel) >= PPST_OutputSize))
+	{
+		return;
+	}
+	const int2 Pixel = PPST_ViewMin + min(int2((float2(Texel) + 0.5f) * float2(PPST_ViewSize) / float2(PPST_OutputSize)), PPST_ViewSize - 1);
+	const float DeviceZ = LoadDeviceZ(Pixel);
+	const bool bHasGeometry = DeviceZ > 0;
+	const float3 TranslatedWorld = bHasGeometry ? PixelToTranslatedWorld(Pixel, DeviceZ) : 0;
+	const float3 Normal = bHasGeometry ? EstimateGeoNormal(Pixel, DeviceZ, TranslatedWorld) : 0;
+	const float SceneDepth = bHasGeometry ? ConvertFromDeviceZ(DeviceZ) : 0;
+
+#if PPST_MODE <= PPST_COMPOSE_VSM
+	float Directional = 1;
+	float LocalVisibility = 1;
+	if (bHasGeometry)
+	{
+		const float SunNoL = GetNoL(Normal, PPST_DirectionalToLight);
+	#if PPST_MODE == PPST_COMPOSE_CSM
+		for (int Cascade = 0; Cascade < PPST_NumShadows; ++Cascade)
+		{
+			if (SceneDepth > PPST_ShadowParams[Cascade].x)
+			{
+				continue;
+			}
+			bool bInTile;
+			const float Shadow = SampleShadowMap2D(Cascade, TranslatedWorld, SunNoL, bInTile);
+			if (bInTile)
+			{
+				Directional = Shadow;
+				break;
+			}
+		}
+	#elif PPST_MODE == PPST_COMPOSE_VSM
+		Directional = SampleVirtualShadowMap(true, PPST_DirectionalVsmId, TranslatedWorld, Normal, PPST_DirectionalToLight, SceneDepth);
+	#endif
+		// Share of the direct light reaching the pixel that the local shadows block. The sun counts as it arrives,
+		// so a lamp's shadow inside the sun's shadow stays strong, and a weak lamp's shadow in full sun nearly vanishes.
+		const float Lost = PPST_LocalLost.Load(int3(Texel, 0));
+		const float Total = PPST_DirectionalEnergy * SunNoL * Directional + PPST_LocalEnergy.Load(int3(Texel, 0));
+		LocalVisibility = Total > 0 ? saturate(1.0f - Lost / Total) : 1.0f;
+	}
+	PPST_MaskOutput[Texel] = float2(Directional, LocalVisibility);
+
+#else
+	float Energy = 0;
+	float Lost = 0;
+	if (bHasGeometry)
+	{
+	#if PPST_MODE == PPST_LOCAL_ARRAY || PPST_MODE == PPST_LOCAL_ARRAY_VSM
+		for (int LightIndex = 0; LightIndex < PPST_NumLights; ++LightIndex)
+		{
+			const float Irradiance = GetLocalIrradiance(LightIndex, TranslatedWorld, Normal);
+			if (Irradiance <= 0)
+			{
+				continue;
+			}
+			Energy += Irradiance;
+		#if PPST_MODE == PPST_LOCAL_ARRAY_VSM
+			const int VirtualShadowMapId = PPST_LightTypeAndVsmId[LightIndex].y;
+			if (VirtualShadowMapId >= 0)
+			{
+				const float3 ToLight = normalize(PPST_LightPositionAndInvRadius[LightIndex].xyz - TranslatedWorld);
+				Lost += Irradiance * (1.0f - SampleVirtualShadowMap(false, VirtualShadowMapId, TranslatedWorld, Normal, ToLight, SceneDepth));
+			}
+		#endif
+		}
+	#else
+		Energy = GetLocalIrradiance(0, TranslatedWorld, Normal);
+		if (Energy > 0)
+		{
+			const float3 ToLight = normalize(PPST_LightPositionAndInvRadius[0].xyz - TranslatedWorld);
+			const float NoL = GetNoL(Normal, ToLight);
+			float Shadow = 1;
+		#if PPST_MODE == PPST_LOCAL_SPOT
+			bool bInTile;
+			Shadow = SampleShadowMap2D(0, TranslatedWorld, NoL, bInTile);
+		#elif PPST_MODE == PPST_LOCAL_CUBE
+			// As MainOnePassPointLightPS: point lights apply their slope bias at projection time, scaled by 1 - NoL.
+			Shadow = CubemapHardwarePCF(PPST_CubeShadowDepth, PPST_CubeShadowSampler, PPST_CubeViewProjection, PPST_CubeParams.x,
+				TranslatedWorld, PPST_LightPositionAndInvRadius[0].xyz, PPST_LightPositionAndInvRadius[0].w, PPST_CubeParams.y,
+				(1 - NoL) * PPST_CubeParams.z, PPST_CubeParams.w);
+			Shadow = saturate((Shadow - 0.5) * PPST_ShadowSharpen + 0.5);
+			Shadow = Square(Shadow);
+			Shadow = lerp(1.0f, Shadow, PPST_CubeFade);
+		#endif
+			Lost = Energy * (1.0f - Shadow);
+		}
+	#endif
+	}
+	#if PPST_MODE == PPST_LOCAL_ARRAY || PPST_MODE == PPST_LOCAL_ARRAY_VSM
+	PPST_LocalEnergyOutput[Texel] = Energy;	// first writer
+	PPST_LocalLostOutput[Texel] = Lost;
+	#else
+	if (Energy > 0)
+	{
+		PPST_LocalEnergyOutput[Texel] = PPST_LocalEnergyOutput[Texel] + Energy;
+		PPST_LocalLostOutput[Texel] = PPST_LocalLostOutput[Texel] + Lost;
+	}
+	#endif
+#endif
+}
