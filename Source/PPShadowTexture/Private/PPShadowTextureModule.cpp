@@ -18,8 +18,8 @@
 #include "SceneViewExtension.h"
 #include "ShaderCore.h"
 
-static_assert(ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION == 8,
-	"PPShadowTexture reads renderer-private shadow structures and supports UE 5.8 only.");
+static_assert(ENGINE_MAJOR_VERSION == 5 && (ENGINE_MINOR_VERSION == 8 || ENGINE_MINOR_VERSION == 9),
+	"PPShadowTexture reads renderer-private shadow structures and supports UE 5.8 and 5.9 only.");
 
 namespace
 {

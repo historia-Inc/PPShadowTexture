@@ -45,6 +45,7 @@ float4 PPST_ShadowTileMinMax[PPST_MAX_CASCADES];			// the tile's UV rect in the 
 float4 PPST_ShadowParams[PPST_MAX_CASCADES];				// x split far (view depth), y transition scale, z fade alpha, w receiver bias (0..1)
 float3 PPST_DirectionalToLight;
 int PPST_NumShadows;
+uint PPST_CascadeContinuationMask;	// bit i: slot i is the dynamic-only half of slot i - 1's cascade
 float PPST_ShadowSharpen;
 
 TextureCube PPST_CubeShadowDepth;
@@ -294,7 +295,7 @@ void MainCS(uint2 Texel : SV_DispatchThreadID)
 	#if PPST_MODE == PPST_COMPOSE_CSM
 		for (int Cascade = 0; Cascade < PPST_NumShadows; ++Cascade)
 		{
-			if (SceneDepth > PPST_ShadowParams[Cascade].x)
+			if (SceneDepth > PPST_ShadowParams[Cascade].x || (PPST_CascadeContinuationMask & (1u << Cascade)) != 0)
 			{
 				continue;
 			}
@@ -303,6 +304,13 @@ void MainCS(uint2 Texel : SV_DispatchThreadID)
 			if (bInTile)
 			{
 				Directional = Shadow;
+				// A cascade split into static and dynamic halves: UE multiplies the two projections.
+				for (int Half = Cascade + 1; Half < PPST_NumShadows && (PPST_CascadeContinuationMask & (1u << Half)) != 0; ++Half)
+				{
+					bool bHalfInTile;
+					const float HalfShadow = SampleShadowMap2D(Half, TranslatedWorld, SunNoL, bHalfInTile);
+					Directional *= bHalfInTile ? HalfShadow : 1.0f;
+				}
 				break;
 			}
 		}

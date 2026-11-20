@@ -2,7 +2,7 @@
 
 Unreal Engine が描いたシャドウマップを再利用して、スクリーンスペースの影マスクをポストプロセスマテリアルから読めるようにするサンプルプラグインです。エンジン改造も、影の描き直しも行いません。
 
-A sample plugin for Unreal Engine 5.8 that reuses the engine's own shadow maps (CSM / VSM / local light shadow maps) and publishes them as a screen-space mask for post process materials. No engine modification.
+A sample plugin for Unreal Engine 5.8 and 5.9 that reuses the engine's own shadow maps (CSM / VSM / local light shadow maps) and publishes them as a screen-space mask for post process materials. No engine modification.
 
 | 通常の表示（Lit） | `PPShadowTexture`（R × G） |
 | :---: | :---: |
@@ -33,15 +33,15 @@ UserSceneTexture `PPShadowTexture`（R8G8、画面解像度）として公開し
 
 ## 動作環境
 
-- Unreal Engine 5.8 専用（他のバージョンでは `static_assert` でビルドが止まります）
+- Unreal Engine 5.8 / 5.9（他のバージョンでは `static_assert` でビルドが止まります）
 - Windows (Win64)、デスクトップのディファードレンダラー、SM5 以上
-- ソースから導入する場合は C++ プロジェクト。ビルド済みバイナリは、インストール済みビルドの UE 5.8（ランチャー版など）で使えます
+- ソースから導入する場合は C++ プロジェクト。ビルド済みバイナリは、インストール済みビルドの UE 5.8 / 5.9（ランチャー版など）で使えます
 
 ## 導入
 
 ### ビルド済みバイナリを使う
 
-[Releases](https://github.com/historia-Inc/PPShadowTexture/releases) から `PPShadowTexture-<バージョン>-UE5.8-Win64.zip` を取得します。エディター用の DLL と、パッケージ用（Development / Shipping）のビルド済みオブジェクトが入っています。
+[Releases](https://github.com/historia-Inc/PPShadowTexture/releases) から、使うエンジンに合わせて `PPShadowTexture-<バージョン>-UE5.8-Win64.zip` または `PPShadowTexture-<バージョン>-UE5.9-Win64.zip` を取得します。エディター用の DLL と、パッケージ用（Development / Shipping）のビルド済みオブジェクトが入っています。
 
 1. zip を展開し、`PPShadowTexture` フォルダをプロジェクトの `Plugins/` に置きます。
 2. エディタでプラグイン「PP Shadow Texture」を有効にします。

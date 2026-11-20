@@ -19,7 +19,7 @@ public class PPShadowTexture : ModuleRules
 		});
 
 		// The shadow data lives in renderer-private structures (FSceneRenderer, FProjectedShadowInfo,
-		// FVirtualShadowMapArray, FSceneTextures::UserSceneTextures). UE 5.8 only.
+		// FVirtualShadowMapArray, FSceneTextures::UserSceneTextures). UE 5.8 and 5.9 only.
 		PrivateIncludePaths.AddRange(new[]
 		{
 			Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Private"),

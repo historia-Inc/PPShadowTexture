@@ -1,6 +1,6 @@
-// Reads UE 5.8's own shadow data for one view in the PostOpaque hook and turns it into a screen space mask.
+// Reads UE 5.8 / 5.9's own shadow data for one view in the PostOpaque hook and turns it into a screen space mask.
 //
-// Sources (all renderer-private, so this file is tied to UE 5.8):
+// Sources (all renderer-private, so this file is tied to UE 5.8 and 5.9):
 // - main directional light: CSM cascades (FProjectedShadowInfo, one atlas) or its VSM clipmap
 // - local lights (point / spot / rect): VSM, or the whole scene shadow map (2D atlas tile for spot,
 //   one-pass cube map for point and rect)
@@ -12,6 +12,7 @@
 #include "HAL/IConsoleManager.h"
 #include "LightSceneInfo.h"
 #include "LightSceneProxy.h"
+#include "Misc/EngineVersionComparison.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "RenderUtils.h"
@@ -101,6 +102,7 @@ public:
 		SHADER_PARAMETER_ARRAY(FVector4f, PPST_ShadowParams, [MaxCascades])	// x split far (view depth), y transition scale, z fade alpha, w receiver bias (0..1)
 		SHADER_PARAMETER(FVector3f, PPST_DirectionalToLight)
 		SHADER_PARAMETER(int32, PPST_NumShadows)
+		SHADER_PARAMETER(uint32, PPST_CascadeContinuationMask)	// bit i: slot i is the dynamic-only half of slot i - 1's cascade
 		SHADER_PARAMETER(float, PPST_ShadowSharpen)
 		// one-pass cube shadow map (point / rect)
 		SHADER_PARAMETER_RDG_TEXTURE(TextureCube, PPST_CubeShadowDepth)
@@ -148,6 +150,14 @@ public:
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("PPST_MAX_CASCADES"), MaxCascades);
 		OutEnvironment.SetDefine(TEXT("PPST_MAX_LIGHTS"), MaxArrayLights);
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 9, 0)
+		// UE 5.9's VSM page table addressing needs this define, which FVirtualShadowMapArray::SetShaderDefines sets
+		// (not exported). Single-page VSMs take the first page table entries: the smallest power of two of entries whose
+		// level 0 pages outnumber VSM_MAX_SINGLE_PAGE_SHADOW_MAPS. The define is the log2 of that entry count.
+		const uint32 SinglePageEntries = FMath::RoundUpToPowerOfTwo(
+			uint32(VSM_MAX_SINGLE_PAGE_SHADOW_MAPS) / (uint32(VSM_LEVEL0_DIM_PAGES_XY) * uint32(VSM_LEVEL0_DIM_PAGES_XY)) + 1u);
+		OutEnvironment.SetDefine(TEXT("VSM_LOG2_FULL_SHADOW_MAP_OFFSET"), *FString::Printf(TEXT("%uu"), FMath::FloorLog2(SinglePageEntries)));
+#endif
 	}
 
 	LAYOUT_FIELD(FShaderUniformBufferParameter, VirtualShadowMapBuffer);
@@ -355,9 +365,29 @@ void SetLocalLight(FPPShadowMaskCS::FParameters& P, int32 Slot, const FViewInfo&
 	P.PPST_LightTypeAndVsmId[Slot] = FIntVector4(LightType, VirtualShadowMapId, LightParameters.FalloffExponent == 0.0f ? 1 : 0, 0);
 }
 
+/** True for the dynamic-only half of a cascade split by r.Shadow.CSMShadowDepthReuse.SeparateDynamic (UE 5.9). */
+bool IsDynamicOnlyCascade(const FProjectedShadowInfo& Shadow)
+{
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 9, 0)
+	return Shadow.bIsDynamicOnly;
+#else
+	return false;
+#endif
+}
+
+/** True for one face of UE 5.9's per-face cube shadow (the WebGPU fallback), which is not a spot light's 2D shadow. */
+bool IsCubeFaceShadow(const FProjectedShadowInfo& Shadow)
+{
+#if UE_VERSION_NEWER_THAN_OR_EQUAL(5, 9, 0)
+	return Shadow.CubeFaceShadowIndex >= 0;
+#else
+	return false;
+#endif
+}
+
 bool IsWholeSceneLocalShadowMap(const FProjectedShadowInfo* Shadow, const FViewInfo& View)
 {
-	return Shadow && Shadow->bWholeSceneShadow && !Shadow->bDirectionalLight && !Shadow->bRayTracedDistanceField &&
+	return Shadow && Shadow->bWholeSceneShadow && !Shadow->bDirectionalLight && !Shadow->bRayTracedDistanceField && !IsCubeFaceShadow(*Shadow) &&
 		!Shadow->HasVirtualShadowMap() && Shadow->RenderTargets.DepthTarget &&
 		(Shadow->DependentView == nullptr || Shadow->DependentView == &View);
 }
@@ -501,8 +531,15 @@ FRDGTextureRef AddMaskPasses(FRDGBuilder& GraphBuilder, const FViewInfo& View, c
 	ArrayLights.SetNum(FMath::Min(ArrayLights.Num(), MaxArrayLights));
 
 	// Cascades are sampled from one atlas; any cascade packed into another atlas is left out.
+	// A cascade split into static and dynamic halves projects both (UE multiplies them); the dynamic half follows the static one.
 	Cascades.Sort([](const FProjectedShadowInfo& A, const FProjectedShadowInfo& B)
-		{ return A.CascadeSettings.ShadowSplitIndex < B.CascadeSettings.ShadowSplitIndex; });
+	{
+		if (A.CascadeSettings.ShadowSplitIndex != B.CascadeSettings.ShadowSplitIndex)
+		{
+			return A.CascadeSettings.ShadowSplitIndex < B.CascadeSettings.ShadowSplitIndex;
+		}
+		return !IsDynamicOnlyCascade(A) && IsDynamicOnlyCascade(B);
+	});
 	const int32 NumAllCascades = Cascades.Num();
 	if (!Cascades.IsEmpty())
 	{
@@ -624,6 +661,11 @@ FRDGTextureRef AddMaskPasses(FRDGBuilder& GraphBuilder, const FViewInfo& View, c
 			const float TransitionSize = CSMDepthBias / (Shadow.MaxSubjectZ - Shadow.MinSubjectZ) *
 				(Shadow.ShadowBounds.W / Shadow.ResolutionX) * MainLight->Proxy->GetUserShadowBias();
 			SetShadowMapSlot(P, Index, View, ViewIndex, Shadow, Shadow.CascadeSettings.SplitFar, TransitionSize, CSMReceiverBias);
+			if (Index > 0 && IsDynamicOnlyCascade(Shadow) &&
+				Cascades[Index - 1]->CascadeSettings.ShadowSplitIndex == Shadow.CascadeSettings.ShadowSplitIndex)
+			{
+				P.PPST_CascadeContinuationMask |= 1u << Index;
+			}
 		}
 		P.PPST_ShadowDepth = GraphBuilder.RegisterExternalTexture(Cascades[0]->RenderTargets.DepthTarget);
 		P.PPST_NumShadows = Cascades.Num();
@@ -644,7 +686,7 @@ FRDGTextureRef AddMaskPasses(FRDGBuilder& GraphBuilder, const FViewInfo& View, c
 
 void RegisterUserSceneTexture(const FViewInfo& View, FRDGTextureRef Mask)
 {
-	// UE 5.8's allocation helper (FindOrAddUserSceneTexture) is not exported and would inherit scene color's
+	// The engine's allocation helper (FindOrAddUserSceneTexture, UE 5.8 / 5.9) is not exported and would inherit scene color's
 	// format, so the existing texture is inserted directly as the most recent entry for this name.
 	const FSceneTextures& SceneTextures = View.GetSceneTextures();
 	TArray<FTransientUserSceneTexture>& Entries = SceneTextures.UserSceneTextures.FindOrAdd(TextureName);
